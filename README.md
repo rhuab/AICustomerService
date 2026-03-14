@@ -1,4 +1,4 @@
-# Letta HR 手册智能问答机器人
+# HR手册智能问答机器人
 
 基于 Letta 的 HR 手册 RAG 问答：PDF 按章节分块、向量存 PostgreSQL（pgvector），显式意图判断后检索，由 Letta Agent 生成答案；无相关结果时回答「我不知道」。
 
@@ -182,6 +182,190 @@ python -m src.query --single "试用期多久" --debug
 grep "a1b2c3d4" app.log
 ```
 
+## Web Server 模式
+
+除 CLI 外还支持 HTTP 服务，提供 **per-user 独立记忆** 和 **相同问题缓存**。
+
+### 启动服务
+
+```bash
+python -m src.server
+# 或
+uvicorn src.server:app --host 0.0.0.0 --port 8000
+```
+
+服务启动后访问 `http://localhost:8000/docs` 查看交互式 API 文档。
+
+
+### 配置
+
+在 `.env` 中新增：
+
+| 变量 | 说明 |
+|------|------|
+| `SERVER_HOST` | 监听地址，默认 `0.0.0.0` |
+| `SERVER_PORT` | 监听端口，默认 `8000` |
+| `ADMIN_API_KEY` | 管理员接口鉴权密钥（**必填**，否则管理接口返回 503） |
+
+### API 接口
+
+#### 1. 用户问答 — `POST /api/ask`
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "user_001", "question": "年假有多少天？"}'
+```
+
+**请求体**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | string | 用户唯一标识（1-128 字符） |
+| `question` | string | 用户问题（1-2000 字符） |
+| `debug` | bool | 可选，是否返回调试信息，默认 false |
+
+**响应**：
+
+```json
+{
+  "answer": "根据手册规定，员工入职满一年后享有5天年假...",
+  "source": "agent",
+  "trace_id": "a1b2c3d4-...",
+  "cached": false
+}
+```
+
+- `source` 可能的值：`agent`（正常回答）、`cache`（命中缓存）、`intent_not_related`、`no_relevant_chunks`
+- `cached: true` 表示该用户之前问过完全相同的问题，直接返回缓存结果
+
+**用户记忆机制**：
+- 每个 `user_id` 首次提问时自动创建一个独立的 Letta Agent
+- Letta Agent 天然维护该用户的对话历史，实现连续对话上下文
+- 相同问题（忽略大小写和首尾空格）直接返回缓存，不重复调用 RAG
+
+#### 2. 查看活跃用户 — `GET /api/admin/users`
+
+```bash
+curl http://localhost:8000/api/admin/users \
+  -H "X-Admin-Key: your-admin-key"
+```
+
+返回所有活跃用户的会话信息：
+
+```json
+[
+  {
+    "user_id": "user_001",
+    "agent_id": "agent-xxxx",
+    "created_at": 1710403200.0,
+    "cached_questions": 5
+  }
+]
+```
+
+#### 3. 清空用户记忆 — `DELETE /api/admin/users/{user_id}/memory`
+
+```bash
+curl -X DELETE http://localhost:8000/api/admin/users/user_001/memory \
+  -H "X-Admin-Key: your-admin-key"
+```
+
+该操作会：
+- 删除该用户的 Letta Agent（清空对话历史）
+- 清空该用户的问答缓存
+- 用户下次提问时会自动创建全新的 Agent
+
+返回：
+
+```json
+{"success": true, "message": "Memory cleared for user user_001"}
+```
+
+#### 4. 健康检查 — `GET /api/health`
+
+```bash
+curl http://localhost:8000/api/health
+```
+
+### 管理员后台管理
+
+所有 `/api/admin/*` 接口需要在请求头中携带 `X-Admin-Key`，值必须与 `.env` 中的 `ADMIN_API_KEY` 一致，否则返回 403。若服务端未配置 `ADMIN_API_KEY`，管理接口返回 503。
+
+#### 鉴权方式
+
+每个管理请求都需要添加 Header：
+
+```
+X-Admin-Key: <你在 .env 中设置的 ADMIN_API_KEY>
+```
+
+#### 典型管理场景
+
+**场景一：某用户反馈回答不对，需要重置其会话**
+
+```bash
+# 1. 先查看该用户的会话状态
+curl http://localhost:8000/api/admin/users \
+  -H "X-Admin-Key: your-admin-key"
+
+# 2. 清空该用户的记忆（删除 Agent + 缓存）
+curl -X DELETE http://localhost:8000/api/admin/users/user_001/memory \
+  -H "X-Admin-Key: your-admin-key"
+
+# 用户下次提问时会自动创建全新的 Agent，从零开始对话
+```
+
+**场景二：批量清理不活跃用户**
+
+```bash
+# 列出所有用户，根据 created_at 判断是否过期
+curl http://localhost:8000/api/admin/users \
+  -H "X-Admin-Key: your-admin-key"
+
+# 逐个清理
+curl -X DELETE http://localhost:8000/api/admin/users/old_user_123/memory \
+  -H "X-Admin-Key: your-admin-key"
+```
+
+**场景三：知识库更新后，清空所有用户缓存**
+
+当重新执行 `python ingest_hr_manual.py` 更新了知识库后，旧的缓存答案可能过时。此时应清空所有用户记忆：
+
+```bash
+# 获取所有 user_id
+USERS=$(curl -s http://localhost:8000/api/admin/users \
+  -H "X-Admin-Key: your-admin-key" | python -c "
+import sys, json
+for u in json.load(sys.stdin):
+    print(u['user_id'])
+")
+
+# 逐个清空
+for uid in $USERS; do
+  curl -X DELETE "http://localhost:8000/api/admin/users/$uid/memory" \
+    -H "X-Admin-Key: your-admin-key"
+done
+```
+
+#### 管理接口一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/admin/users` | 列出所有活跃用户（user_id、agent_id、创建时间、缓存问题数） |
+| `DELETE` | `/api/admin/users/{user_id}/memory` | 清空指定用户的 Letta Agent 和问答缓存 |
+| `GET` | `/api/health` | 健康检查（含 `db_pool` 数据库连接状态，无需鉴权） |
+
+#### 清空记忆的效果
+
+执行 `DELETE /api/admin/users/{user_id}/memory` 后：
+
+| 项目 | 效果 |
+|------|------|
+| Letta Agent | 删除，对话历史清零 |
+| 问答缓存 | 清空，相同问题会重新走 RAG 流程 |
+| 用户下次提问 | 自动创建全新 Agent，如同首次访问 |
+
 ## 项目结构
 
 - `src/config.py` — 环境变量与可配置项（含 RAG_TOP_K、RAG_SIMILARITY_THRESHOLD）
@@ -189,8 +373,10 @@ grep "a1b2c3d4" app.log
 - `src/embedding.py` — OpenAI 向量化
 - `src/vector_store.py` — asyncpg 连接池 + pgvector 建表/插入/检索
 - `src/intent.py` — 显式意图：是否与 HR 手册相关
-- `src/letta_agent.py` — Letta Agent 创建与调用
+- `src/letta_agent.py` — Letta Agent 创建与调用（含 per-user Agent）
 - `src/query.py` — 问答主流程（意图 → 检索 → Agent/「我不知道」）+ trace_id/DEBUG
+- `src/user_manager.py` — 用户会话管理（Agent 映射 + 问答缓存）
+- `src/server.py` — FastAPI Web Server（HTTP API + 管理员接口）
 - `ingest_hr_manual.py` — 入库入口
 - `create_agent.py` — 一次性创建 Agent
 
@@ -199,3 +385,19 @@ grep "a1b2c3d4" app.log
 1. **意图**：先判断问题是否与 HR 手册相关；不相关则直接回答「我不知道」，不检索。
 2. **检索**：对问题做 embedding，在 pgvector 中按余弦相似度取 top_k，仅保留相似度 ≥ 阈值的 chunk。
 3. **回答**：若有有效 chunk，将内容拼成上下文交给 Letta Agent 生成答案；否则回答「我不知道」。
+
+### Web Server 模式流程
+
+```
+用户请求 (user_id + question)
+    │
+    ├─ 缓存命中？ ──是──▶ 直接返回缓存结果 (source=cache)
+    │
+    ├─ 该用户首次？──是──▶ 创建 per-user Letta Agent
+    │
+    ├─ 意图判断 ──不相关──▶ 返回「我不知道」
+    │
+    ├─ 向量检索 ──无结果──▶ 返回「我不知道」
+    │
+    └─ 调用该用户的 Letta Agent（带上下文）──▶ 返回答案 + 缓存
+```

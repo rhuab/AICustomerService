@@ -38,6 +38,20 @@ def create_hr_agent(client: Letta | None = None) -> Any:
     return agent
 
 
+def create_user_agent(user_id: str, client: Letta | None = None) -> Any:
+    """Create a per-user HR handbook agent. Returns agent object with .id."""
+    c = client or get_client()
+    agent = c.agents.create(
+        name=f"HR Assistant [{user_id}]",
+        description=f"Per-user HR handbook assistant for user {user_id}.",
+        memory_blocks=[
+            {"label": "persona", "value": PERSONA},
+        ],
+    )
+    logger.info("Created per-user agent: user=%s agent_id=%s", user_id, agent.id)
+    return agent
+
+
 def ask_agent(
     agent_id: str,
     context: str,

@@ -54,3 +54,8 @@ DEBUG_RESPONSE_INCLUDE_CONTEXT: bool = os.getenv(
 
 # HR PDF source (for ingestion)
 HR_PDF_PATH: str = os.getenv("HR_PDF_PATH", "HR.pdf").strip()
+
+# Web server
+SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0").strip()
+SERVER_PORT: int = _int_env("SERVER_PORT", 8000)
+ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "").strip()
